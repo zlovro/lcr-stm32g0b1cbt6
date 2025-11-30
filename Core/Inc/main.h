@@ -61,6 +61,8 @@ void Error_Handler(void);
 #define VOLTAGE_L_GPIO_Port GPIOA
 #define VOLTAGE_R_Pin GPIO_PIN_1
 #define VOLTAGE_R_GPIO_Port GPIOA
+#define GATE_Pin GPIO_PIN_2
+#define GATE_GPIO_Port GPIOA
 #define SINE_OUT_Pin GPIO_PIN_4
 #define SINE_OUT_GPIO_Port GPIOA
 

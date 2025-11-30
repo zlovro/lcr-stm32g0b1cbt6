@@ -46,6 +46,7 @@ DMA_HandleTypeDef hdma_adc1;
 DAC_HandleTypeDef hdac1;
 DMA_HandleTypeDef hdma_dac1_ch1;
 
+TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim15;
 
 /* USER CODE BEGIN PV */
@@ -59,6 +60,7 @@ static void MX_DMA_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_TIM15_Init(void);
 static void MX_DAC1_Init(void);
+static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -68,12 +70,29 @@ static void MX_DAC1_Init(void);
 
 #include <stdlib.h>
 #include <fastmath.h>
+#include <stdbool.h>
 
 #define DAC_TIM TIM15
 
 #define MEASUREMENT_POINT_COUNT (0xFFFFFFFF / 4095)
-#define ADC_CHUNK_SIZE 32768
-#define ADC_CHUNK_COUNT (MEASUREMENT_POINT_COUNT / ADC_CHUNK_SIZE)
+#define ADC_CHUNK_SIZE 65536
+#define ADC_CHUNK_COUNT (2 * (MEASUREMENT_POINT_COUNT / ADC_CHUNK_SIZE))
+
+#define ADC_TO_VOLTAGE(n) ((3.3 * (ADC_SENSE_ ## n ## _R1_OHMS + ADC_SENSE_ ## n ## _R2_OHMS)) / (4095 * ADC_SENSE_ ## n ## _R2_OHMS))
+
+#define ADC_SENSE_GND_R1_OHMS 10000.0
+#define ADC_SENSE_GND_R2_OHMS 4700.0
+#define ADC_SENSE_GND_ADC_TO_VOLTAGE ADC_TO_VOLTAGE(GND)
+
+#define ADC_SENSE_R_R1_OHMS 10000.0
+#define ADC_SENSE_R_R2_OHMS 4700.0
+#define ADC_SENSE_R_ADC_TO_VOLTAGE ADC_TO_VOLTAGE(R)
+
+#define ADC_SENSE_L_R1_OHMS 10000.0
+#define ADC_SENSE_L_R2_OHMS 4700.0
+#define ADC_SENSE_L_ADC_TO_VOLTAGE ADC_TO_VOLTAGE(L)
+
+#define ADC_SENSE_L_R_OHMS 10.0
 
 #define MAX_POINTS 512
 #define MIN_POINTS 4
@@ -81,8 +100,10 @@ static void MX_DAC1_Init(void);
 uint16_t *gDacBuf;
 
 uint16_t gAdcBuf[ADC_CHUNK_SIZE];
-uint32_t gAdcSum = 0;
-
+double   gAdcAdcToVoltageFactor = 0;
+double   gAdcSum                = 0;
+uint16_t gAdcChunksProcessed    = 0;
+bool     gAdcIsComplete         = false;
 
 void generateSine(int pPoints)
 {
@@ -95,7 +116,7 @@ void generateSine(int pPoints)
     }
 }
 
-void setupAdc(int pChannel)
+void setupAdc(uint32_t pChannel)
 {
     ADC_ChannelConfTypeDef sConfig = {0};
 
@@ -108,7 +129,7 @@ void setupAdc(int pChannel)
     hadc1.Init.LowPowerAutoWait      = DISABLE;
     hadc1.Init.LowPowerAutoPowerOff  = DISABLE;
     hadc1.Init.ContinuousConvMode    = ENABLE;
-    hadc1.Init.NbrOfConversion       = 1;
+    hadc1.Init.NbrOfConversion       = 2;
     hadc1.Init.ExternalTrigConv      = ADC_EXTERNALTRIG_T15_TRGO;
     hadc1.Init.ExternalTrigConvEdge  = ADC_EXTERNALTRIGCONVEDGE_RISING;
     hadc1.Init.DMAContinuousRequests = ENABLE;
@@ -122,9 +143,7 @@ void setupAdc(int pChannel)
         Error_Handler();
     }
 
-    /** Configure Regular Channel
-    */
-    sConfig.Channel      = ADC_CHANNEL_0;
+    sConfig.Channel      = pChannel;
     sConfig.Rank         = ADC_REGULAR_RANK_1;
     sConfig.SamplingTime = ADC_SAMPLINGTIME_COMMON_1;
     if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
@@ -132,28 +151,106 @@ void setupAdc(int pChannel)
         Error_Handler();
     }
 
-    /** Configure Regular Channel
-    */
-    sConfig.Channel = ADC_CHANNEL_1;
-    sConfig.Rank    = ADC_REGULAR_RANK_2;
+    sConfig.Channel      = ADC_CHANNEL_2;
+    sConfig.Rank         = ADC_REGULAR_RANK_2;
+    sConfig.SamplingTime = ADC_SAMPLINGTIME_COMMON_1;
     if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
     {
         Error_Handler();
     }
-    /* USER CODE BEGIN ADC1_Init 2 */
-
-    /* USER CODE END ADC1_Init 2 */
 }
 
-void startMeasuring()
+#define gateOn() HAL_GPIO_WritePin(GATE_GPIO_Port, GATE_Pin, 1)
+#define gateOff() HAL_GPIO_WritePin(GATE_GPIO_Port, GATE_Pin, 0)
+
+double measure(double *pInductancesArr)
 {
-    float timFreq = (float) SystemCoreClock / ((float) (DAC_TIM->ARR + 1) * (float) (DAC_TIM->PSC + 1));
-    for (int points = MAX_POINTS; points >= MIN_POINTS; points >>= 1)
+    double inductanceSum = 0;
+    double timFreq       = (double) SystemCoreClock / ((double) (DAC_TIM->ARR + 1) * (float) (DAC_TIM->PSC + 1));
+
+    int i = 0;
+    for (int points = MAX_POINTS; points >= MIN_POINTS; points >>= 1, i++)
     {
+        gateOn();
+        HAL_Delay(100);
+
         generateSine(points);
         HAL_DAC_Start_DMA(&hdac1, DAC_CHANNEL_1, (uint32_t *) gDacBuf, points, DAC_ALIGN_12B_R);
 
-        float freq = timFreq / (float) points;
+        // measure RMS voltage of resistor (input voltage)
+        setupAdc(ADC_CHANNEL_0);
+
+        gAdcChunksProcessed    = 0;
+        gAdcSum                = 0;
+        gAdcAdcToVoltageFactor = ADC_SENSE_R_ADC_TO_VOLTAGE;
+        HAL_ADC_Start_DMA(&hadc1, gAdcBuf, ADC_CHUNK_SIZE);
+
+        while (true)
+        {
+            if (gAdcIsComplete)
+            {
+                break;
+            }
+        }
+
+        double voltageResistorRms = sqrt(gAdcSum / (double) (ADC_CHUNK_SIZE / 2));
+
+        // measure RMS voltage of inductor (output voltage)
+        setupAdc(ADC_CHANNEL_1);
+
+        gAdcChunksProcessed    = 0;
+        gAdcSum                = 0;
+        gAdcAdcToVoltageFactor = ADC_SENSE_L_ADC_TO_VOLTAGE;
+
+        HAL_ADC_Start_DMA(&hadc1, gAdcBuf, ADC_CHUNK_SIZE);
+
+        while (true)
+        {
+            if (gAdcIsComplete)
+            {
+                break;
+            }
+        }
+
+        double voltageInductorRms = sqrt(gAdcSum / (double) (ADC_CHUNK_SIZE / 2));
+        double xl                 = voltageInductorRms * ADC_SENSE_L_R_OHMS / (voltageResistorRms - voltageInductorRms);
+        double frequency          = timFreq / (double) points;
+        double inductance         = xl / (M_TWOPI * frequency);
+
+        pInductancesArr[i] = inductance;
+        inductanceSum += inductance;
+
+        // ReSharper disable once CppDFADeletedPointer
+        free(gDacBuf);
+
+        gateOff();
+        HAL_Delay(100);
+    }
+
+    double averageInductance = inductanceSum / i;
+    return averageInductance;
+}
+
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
+{
+    TIM2->CNT = 0;
+
+    register double stackVoltageFactor = gAdcAdcToVoltageFactor;
+    for (int i = 0; i < ADC_CHUNK_SIZE; i += 2)
+    {
+        gAdcSum += gAdcBuf[i] * stackVoltageFactor - gAdcBuf[1] * ADC_SENSE_GND_ADC_TO_VOLTAGE;
+    }
+
+    uint32_t us = TIM2->CNT;
+    if (us > 26200)
+    {
+        Error_Handler();
+    }
+
+    gAdcChunksProcessed++;
+    if (gAdcChunksProcessed >= ADC_CHUNK_COUNT)
+    {
+        HAL_ADC_Stop_DMA(&hadc1);
     }
 }
 
@@ -191,9 +288,14 @@ int main(void)
     MX_ADC1_Init();
     MX_TIM15_Init();
     MX_DAC1_Init();
+    MX_TIM2_Init();
     /* USER CODE BEGIN 2 */
 
+    HAL_TIM_Base_Start(&htim2);
     HAL_TIM_Base_Start(&htim15);
+
+    double inductances[10] = {0};
+    double inductance      = measure(inductances);
 
     /* USER CODE END 2 */
 
@@ -359,6 +461,49 @@ static void MX_DAC1_Init(void)
 }
 
 /**
+  * @brief TIM2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM2_Init(void)
+{
+    /* USER CODE BEGIN TIM2_Init 0 */
+
+    /* USER CODE END TIM2_Init 0 */
+
+    TIM_ClockConfigTypeDef  sClockSourceConfig = {0};
+    TIM_MasterConfigTypeDef sMasterConfig      = {0};
+
+    /* USER CODE BEGIN TIM2_Init 1 */
+
+    /* USER CODE END TIM2_Init 1 */
+    htim2.Instance               = TIM2;
+    htim2.Init.Prescaler         = 63;
+    htim2.Init.CounterMode       = TIM_COUNTERMODE_UP;
+    htim2.Init.Period            = 4294967295;
+    htim2.Init.ClockDivision     = TIM_CLOCKDIVISION_DIV1;
+    htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+    if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+    {
+        Error_Handler();
+    }
+    sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+    if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+    {
+        Error_Handler();
+    }
+    sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+    sMasterConfig.MasterSlaveMode     = TIM_MASTERSLAVEMODE_DISABLE;
+    if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+    {
+        Error_Handler();
+    }
+    /* USER CODE BEGIN TIM2_Init 2 */
+
+    /* USER CODE END TIM2_Init 2 */
+}
+
+/**
   * @brief TIM15 Initialization Function
   * @param None
   * @retval None
@@ -412,7 +557,7 @@ static void MX_DMA_Init(void)
 
     /* DMA interrupt init */
     /* DMA1_Channel1_IRQn interrupt configuration */
-    HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 0, 0);
+    HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 3, 0);
     HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
     /* DMA1_Channel2_3_IRQn interrupt configuration */
     HAL_NVIC_SetPriority(DMA1_Channel2_3_IRQn, 0, 0);
@@ -426,12 +571,23 @@ static void MX_DMA_Init(void)
   */
 static void MX_GPIO_Init(void)
 {
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
     /* USER CODE BEGIN MX_GPIO_Init_1 */
     /* USER CODE END MX_GPIO_Init_1 */
 
     /* GPIO Ports Clock Enable */
     __HAL_RCC_GPIOF_CLK_ENABLE();
     __HAL_RCC_GPIOA_CLK_ENABLE();
+
+    /*Configure GPIO pin Output Level */
+    HAL_GPIO_WritePin(GATE_GPIO_Port, GATE_Pin, GPIO_PIN_RESET);
+
+    /*Configure GPIO pin : GATE_Pin */
+    GPIO_InitStruct.Pin   = GATE_Pin;
+    GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull  = GPIO_PULLDOWN;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GATE_GPIO_Port, &GPIO_InitStruct);
 
     /* USER CODE BEGIN MX_GPIO_Init_2 */
     /* USER CODE END MX_GPIO_Init_2 */
