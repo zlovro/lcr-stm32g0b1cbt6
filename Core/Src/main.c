@@ -213,9 +213,9 @@ double measure(double *pInductancesArr)
         }
 
         double voltageInductorRms = sqrt(gAdcSum / (double) (ADC_CHUNK_SIZE / 2));
-        double xl                 = voltageInductorRms * ADC_SENSE_L_R_OHMS / (voltageResistorRms - voltageInductorRms);
         double frequency          = timFreq / (double) points;
-        double inductance         = xl / (M_TWOPI * frequency);
+        double w                  = M_TWOPI * frequency;
+        double inductance         = voltageInductorRms * ADC_SENSE_L_R_OHMS / (w * sqrt(voltageResistorRms * voltageResistorRms - voltageInductorRms * voltageInductorRms));
 
         pInductancesArr[i] = inductance;
         inductanceSum += inductance;
